@@ -1,0 +1,161 @@
+# Copyright 2022 The Magma Authors.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# owner: @magma/approvers-gw, @magma/approvers-infra
+# purpose: Unit testing and packaging the AGW with Bazel. Starlark format checking.
+# remediation: https://magma.github.io/magma/docs/next/bazel/agw_with_bazel
+
+name: AGW Build, Format & Test Bazel
+on:
+  # yamllint disable-line rule:truthy
+  workflow_dispatch:
+    inputs:
+      publish_bazel_profile:
+        description: 'Publish bazel profile data (default: false)'
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    outputs:
+      artifacts:
+        value: ${{ jobs.bazel_package.outputs.artifacts }}
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+    branches:
+      - 'release/*'
+permissions:
+  contents: write 
+env:
+  BAZEL_BASE_IMAGE: "ghcr.io/magma/magma/bazel-base:latest"
+  # Warning: the values of BAZEL_CACHE_PLAIN_IMAGE and BAZEL_CACHE_PROD_IMAGE
+  # need to be repeated in the matrix workflow includes for "docker-image-cache".
+  BAZEL_CACHE_PLAIN_IMAGE: "ghcr.io/magma/magma/bazel-cache-plain:latest"
+  BAZEL_CACHE_PROD_IMAGE: "ghcr.io/magma/magma/bazel-cache-prod:latest"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  bazel_package:
+    name: Bazel Package Job
+    runs-on: ubuntu-20.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check Out Repo
+        # This is necessary for overlays into the Docker container below.
+        uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # pin@v3.1.0
+      - name: Maximize build space
+        uses: ./.github/workflows/composite/maximize-build-space
+      - name: Setup Bazel Docker Image
+        uses: addnab/docker-run-action@4f65fabd2431ebc8d299f8e5a018d79a769ae185 # pin@v3
+        with:
+          image: ${{ env.BAZEL_CACHE_PROD_IMAGE }}
+          options: --pull always
+          # Run a simple echo command to pull down the image. This makes it a bit more clear how much time is spent on building Magma and not pulling down the image.
+          run: |
+            echo "Pulled the bazel docker image!"
+      - name: Build .deb Packages
+        uses: addnab/docker-run-action@4f65fabd2431ebc8d299f8e5a018d79a769ae185 # pin@v3
+        with:
+          image: ${{ env.BAZEL_CACHE_PROD_IMAGE }}
+          shell: bash
+          # TODO: Remove work-around mount of Github workspace to /magma (https://github.com/addnab/docker-run-action/issues/11)
+          options: -v ${{ github.workspace }}:/workspaces/magma/ -v ${{ github.workspace }}/lte/gateway/configs:/etc/magma
+          run: |
+            cd /workspaces/magma
+            set -euo pipefail
+            printf '\r%s\r' '###############################' 1>&2
+            printf '\r%s\r' 'Building the release package.' 1>&2
+            printf '\r%s\r' '###############################' 1>&2
+            bazel run //lte/gateway/release:release_build \
+              --config=production \
+              --profile=Bazel_build_package_profile
+            mkdir packages
+            cp /tmp/packages/*.deb packages
+            echo "Moving the service executables, which are needed for the" 1>&2
+            echo "Sentry release, to a mounted folder 'sentry_services' in the repository..." 1>&2
+            mkdir sentry_services
+            mv ./bazel-bin/lte/gateway/c/connection_tracker/src/connectiond ./sentry_services/connectiond
+            mv ./bazel-bin/lte/gateway/c/li_agent/src/liagentd ./sentry_services/liagentd
+            # 'agw_of' is renamed to 'mme' to be consistent with the previous sentry.io publishing names
+            mv ./bazel-bin/lte/gateway/c/core/agw_of ./sentry_services/mme
+            mv ./bazel-bin/lte/gateway/c/sctpd/src/sctpd ./sentry_services/sctpd
+            mv ./bazel-bin/lte/gateway/c/session_manager/sessiond ./sentry_services/sessiond
+      - name: Get magma version
+        run: |
+          version_pattern="magma_([0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[a-z0-9]+)_amd64.deb"
+          for i in packages/*.deb; do
+              if [[ $i =~ $version_pattern ]]; then
+                  magma_version=${BASH_REMATCH[1]}
+              fi
+          done
+          if [[ -z "$magma_version" ]]; then
+              echo "No file found with a matching version pattern \"${version_pattern}\". Files in folder:"
+              ls -la packages/*.deb
+              exit 1
+          else
+              echo "Exporting magma version \"${magma_version}\""
+              echo "MAGMA_VERSION=${magma_version}" >> $GITHUB_ENV
+          fi
+        # Step to Initialize Git LFS and track .deb files
+      - name: Initialize Git LFS
+        run: |
+          # Configure Git user info
+          git config --global user.email "mohin.my@gmail.com"
+          git config --global user.name "mohin987"
+          ls -l
+          #mkdir -p packages  
+          #mv /tmp/packages/*.deb packages      
+          git lfs install
+          git lfs install --skip-repo
+          git lfs track "packages/*.deb"
+          echo "Bazel_build_package_profile" >> .gitignore 
+          echo "semicolon_delimited_script" >> .gitignore
+          echo "sentry_services" >> .gitignore
+          git add .gitattributes
+          git add .gitignore
+      - name: Add and Commit Packages to Git
+        run: |
+          git add packages/*
+          git status
+          git commit -m "Add built .deb packages" || echo "No changes to commit"
+
+      - name: Push Changes to Repository
+        env:
+          GITHUB_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+        run: |
+           git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }} 
+        
+
+       # run: |
+        #  git config --global user.email "mohin.my@gmail.com"
+        #  git config --global user.name "mohin987"
+        #  git lfs install
+        #  git lfs track "*.deb"
+        #  git add .gitattributes
+        #  git add packages/*
+        #  git commit -m "Add built .deb packages" || echo "No changes to commit"
+        #  git push https://x-access-token:${{ secrets.ACCESS_TOKEN }}@github.com/${{ github.repository }} HEAD:main || echo "First push attempt failed"
+        #  git remote add sample https://x-access-token:${{ secrets.ACCESS_TOKEN }}@github.com/mohin987/sample.git 
+        #  git push -v -u --force sample main
+        #env:
+        #  ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+      - name: Publish debian packages
+        id: publish_agw_deb_pkg
+        env:
+          DEBIAN_META_INFO: deb.distribution=focal-1.9.0;deb.component=main;deb.architecture=amd64
+        run: |
+            ls package/
